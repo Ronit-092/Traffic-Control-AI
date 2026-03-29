@@ -16,3 +16,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+@app.get("/")
+def root():
+    return {
+        "name": "Traffic-AI",
+        "description": "Traffic signal control RL environment",
+        "endpoints": ["/health", "/reset", "/step", "/state", "/docs"],
+        "hackathon": "ScalarX x Meta 2026"
+    }
