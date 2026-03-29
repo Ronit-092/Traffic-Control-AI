@@ -9,14 +9,6 @@ from models import TrafficAction, TrafficObservation
 app = create_fastapi_app(TrafficEnvironment, TrafficAction, TrafficObservation)
 
 
-def main():
-    import uvicorn
-    uvicorn.run("server.app:app", host="0.0.0.0", port=8000, reload=False)
-
-
-if __name__ == "__main__":
-    main()
-
 @app.get("/")
 def root():
     return {
@@ -25,3 +17,12 @@ def root():
         "endpoints": ["/health", "/reset", "/step", "/state", "/docs"],
         "hackathon": "ScalarX x Meta 2026"
     }
+
+
+def main():
+    import uvicorn
+    uvicorn.run("server.app:app", host="0.0.0.0", port=8000, reload=False)
+
+
+if __name__ == "__main__":
+    main()
