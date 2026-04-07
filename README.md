@@ -11,7 +11,7 @@ pinned: false
 # 🚦 Traffic-AI — OpenEnv Traffic Signal Control
 
 > **ScalarX × Meta Hackathon 2026** — Round 1 Submission  
-> Built by **Ronit-9** on the OpenEnv standard (Meta PyTorch × Hugging Face)
+> Built by **Team: 3 Bit Coders** on the OpenEnv standard (Meta PyTorch × Hugging Face)
 
 A Reinforcement Learning environment where a **PPO agent** learns to control traffic signals at dynamic road junctions — maximising vehicle throughput and prioritising emergency vehicles over normal traffic.
 
