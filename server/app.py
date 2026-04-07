@@ -3,6 +3,7 @@ server/app.py — FastAPI server with live dashboard.
 Custom REST endpoints with exact response format the UI expects.
 """
 
+import os
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -381,7 +382,8 @@ window.onload=()=>setTimeout(doReset,400);
 
 
 def main():
-    uvicorn.run("server.app:app", host="0.0.0.0", port=8000, reload=False)
+    port = int(os.getenv("PORT", 7860))
+    uvicorn.run("server.app:app", host="0.0.0.0", port=port, reload=False)
 
 
 if __name__ == "__main__":

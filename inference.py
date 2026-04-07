@@ -1,139 +1,136 @@
 """
-inference.py — LLM agent for Traffic-AI OpenEnv.
+inference.py — LLM agent for Traffic-AI OpenEnv environment.
 
-Required env vars:
-    API_BASE_URL   — LLM API endpoint
-    MODEL_NAME     — model identifier
-    HF_TOKEN       — Hugging Face / API key
-    ENV_URL        — Traffic-AI server URL (your HF Space)
+Follows the EXACT sample inference.py log format:
+  [START] task=<task> env=<env> model=<model>
+  [STEP]  step=<n> action=<action> reward=<0.00> done=<true|false> error=<msg|null>
+  [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...>
 """
 
 import os
 import json
-import requests
+import textwrap
 from typing import List, Optional
+import requests
 from openai import OpenAI
 
-# ── Env vars ────────────────────────────────────────────────────────────
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN     = os.getenv("HF_TOKEN", "")
-ENV_URL      = os.getenv("ENV_URL", "https://ronit-9-traffic-control-ai.hf.space")
-TASK_NAME    = os.getenv("TRAFFIC_TASK", "medium")
-BENCHMARK    = "traffic-ai"
-MAX_STEPS    = 15
+# ── Environment variables (mandatory) ─────────────────────────────────
+API_BASE_URL     = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME       = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN         = os.getenv("HF_TOKEN")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
-# Score normalisation: medium task, per-step reward max ~10
-MAX_TOTAL_REWARD = MAX_STEPS * 10.0
-SUCCESS_SCORE_THRESHOLD = 0.3
+API_KEY = HF_TOKEN or os.getenv("API_KEY", "dummy")
 
-# ── Logging (exact format required by OpenEnv) ──────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────
+ENV_URL    = "https://ronit-9-traffic-control-ai.hf.space"
+TASK_NAME  = "traffic-signal-control"
+BENCHMARK  = "traffic-ai"
+MAX_STEPS  = 15
+TEMPERATURE = 0.3
+MAX_TOKENS  = 150
+SUCCESS_SCORE_THRESHOLD = 0.1
+
+# ── OpenAI client ──────────────────────────────────────────────────────
+client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+# ── Log helpers (exact format from sample) ─────────────────────────────
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
-def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
-    error_val = error if error else "null"
-    done_val  = str(done).lower()
-    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+def log_step(step: int, action: str, reward: float,
+             done: bool, error: Optional[str]) -> None:
+    err = error if error else "null"
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} "
+          f"done={str(done).lower()} error={err}", flush=True)
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+def log_end(success: bool, steps: int,
+            score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+    print(f"[END] success={str(success).lower()} steps={steps} "
+          f"score={score:.3f} rewards={rewards_str}", flush=True)
 
-# ── OpenAI client ───────────────────────────────────────────────────────
-_client = None
-def get_client():
-    global _client
-    if _client is None:
-        _client = OpenAI(
-            base_url=API_BASE_URL,
-            api_key=HF_TOKEN if HF_TOKEN else "dummy",
-        )
-    return _client
-
-# ── Env HTTP calls ──────────────────────────────────────────────────────
-def env_reset():
-    resp = requests.post(f"{ENV_URL}/reset", json={}, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-def env_step(action_id: int):
-    resp = requests.post(f"{ENV_URL}/step", json={"action_id": action_id}, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-# ── Action descriptions ─────────────────────────────────────────────────
+# ── Action descriptions ────────────────────────────────────────────────
 ACTION_DESCRIPTIONS = {
     "cross": {0:"NS green",1:"EW green",2:"North only",3:"East only"},
     "T":     {0:"NS green",1:"East green",2:"North only",3:"South only"},
-    "Y":     {0:"North",1:"East",2:"West",3:"North+East"},
+    "Y":     {0:"North",   1:"East",     2:"West",      3:"North+East"},
 }
 
-SYSTEM_PROMPT = """You are an intelligent traffic signal controller AI.
-At each step you receive vehicle queues and emergency status.
-ALWAYS prioritise emergency vehicles first.
-Respond ONLY with a JSON object: {"action_id": <0-3>, "reason": "<brief>"}"""
+SYSTEM_PROMPT = textwrap.dedent("""
+    You are an intelligent traffic signal controller AI.
+    At each step you receive vehicle queues and emergency status.
+    
+    PRIORITY: If an emergency vehicle is present, ALWAYS serve that lane first.
+    Otherwise clear the most congested lanes.
+    
+    Respond ONLY with a JSON object:
+    {"action_id": <0-3>, "reason": "<brief>"}
+""").strip()
 
-def format_obs(obs: dict) -> str:
-    tc  = obs.get("traffic_counts", {})
-    em  = obs.get("emergency", {})
-    jt  = obs.get("junction_type", "cross")
-    em_lanes = [d for d, v in em.items() if v]
-    em_str   = f"EMERGENCY at {em_lanes[0].upper()}!" if em_lanes else "None"
-    acts = ACTION_DESCRIPTIONS.get(jt, ACTION_DESCRIPTIONS["cross"])
-    act_str = "\n".join(f"  {k}: {v}" for k, v in acts.items())
-    return (f"Junction: {jt}\n"
-            f"Queues — N:{tc.get('north',0)} S:{tc.get('south',0)} "
-            f"E:{tc.get('east',0)} W:{tc.get('west',0)}\n"
-            f"Emergency: {em_str}\nActions:\n{act_str}\nChoose action_id 0-3.")
+# ── Environment helpers ────────────────────────────────────────────────
+def env_reset() -> dict:
+    r = requests.post(f"{ENV_URL}/reset", json={},
+                      headers={"Content-Type": "application/json"}, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-def heuristic_action(obs: dict) -> tuple:
-    tc = obs.get("traffic_counts", {})
-    em = obs.get("emergency", {})
-    em_lanes = [d for d, v in em.items() if v]
-    if em_lanes:
-        d = em_lanes[0]
-        return (0, f"emergency-{d}") if d in ("north","south") else (1, f"emergency-{d}")
-    ns = tc.get("north",0) + tc.get("south",0)
-    ew = tc.get("east",0)  + tc.get("west",0)
-    return (0,"busy-NS") if ns >= ew else (1,"busy-EW")
+def env_step(action_id: int) -> dict:
+    r = requests.post(f"{ENV_URL}/step",
+                      json={"action_id": action_id},
+                      headers={"Content-Type": "application/json"}, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-def get_llm_action(obs: dict, step: int) -> tuple:
-    raw = ""
+def env_state() -> dict:
+    r = requests.get(f"{ENV_URL}/state", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+# ── LLM decision ──────────────────────────────────────────────────────
+def build_prompt(obs: dict) -> str:
+    traffic   = obs.get("traffic_counts", {})
+    emergency = obs.get("emergency", {})
+    junction  = obs.get("junction_type", "cross")
+    em_lanes  = [d for d, v in emergency.items() if v]
+    em_str    = f"🚑 EMERGENCY at {em_lanes[0].upper()}!" if em_lanes else "None"
+    actions   = ACTION_DESCRIPTIONS.get(junction, ACTION_DESCRIPTIONS["cross"])
+    act_str   = "\n".join(f"  {k}: {v}" for k, v in actions.items())
+    return (f"Junction: {junction}\n"
+            f"Queues: N={traffic.get('north',0)} S={traffic.get('south',0)} "
+            f"E={traffic.get('east',0)} W={traffic.get('west',0)}\n"
+            f"Emergency: {em_str}\n"
+            f"Actions:\n{act_str}\n"
+            f"Choose action_id and give reason.")
+
+def get_llm_action(obs: dict) -> tuple[int, str]:
     try:
-        client   = get_client()
-        response = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": format_obs(obs)},
+                {"role": "user",   "content": build_prompt(obs)},
             ],
-            max_tokens=100,
-            temperature=0.1,
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
         )
-        raw     = response.choices[0].message.content.strip()
-        content = raw
+        content = resp.choices[0].message.content.strip()
         if "```" in content:
-            parts   = content.split("```")
-            content = parts[1] if len(parts) > 1 else parts[0]
-            if content.lower().startswith("json"):
-                content = content[4:]
-        parsed    = json.loads(content.strip())
+            content = content.split("```")[1].lstrip("json").strip()
+        parsed    = json.loads(content)
         action_id = max(0, min(3, int(parsed.get("action_id", 0))))
         reason    = parsed.get("reason", "")
         return action_id, reason
-    except json.JSONDecodeError:
-        for c in raw:
-            if c in "0123":
-                return int(c), "json-parse-fallback"
-        return heuristic_action(obs)
     except Exception as e:
-        print(f"[DEBUG] LLM error step {step}: {e}", flush=True)
-        return heuristic_action(obs)
+        # Fallback to highest queue
+        traffic = obs.get("traffic_counts", {})
+        ns = traffic.get("north", 0) + traffic.get("south", 0)
+        ew = traffic.get("east",  0) + traffic.get("west",  0)
+        return (0 if ns >= ew else 1), f"fallback({e})"
 
-# ── Main ────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────
 def main():
-    rewards: List[float] = []
+    rewards:    List[float] = []
     steps_taken = 0
     score       = 0.0
     success     = False
@@ -141,39 +138,53 @@ def main():
     log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        obs = env_reset()
+        obs   = env_reset()
+        junction = obs.get("junction_type", "cross")
 
         for step in range(1, MAX_STEPS + 1):
-            if obs.get("done", False):
+            done = obs.get("done", False)
+            if done:
                 break
 
-            action_id, reason = get_llm_action(obs, step)
-            error_msg = None
+            action_id, reason = get_llm_action(obs)
 
-            try:
-                result = env_step(action_id)
-            except Exception as e:
-                error_msg = str(e)
-                result = {"reward": 0.0, "done": False, **obs}
+            # Get action label for logging
+            labels = ACTION_DESCRIPTIONS.get(junction, ACTION_DESCRIPTIONS["cross"])
+            action_label = labels.get(action_id, str(action_id))
 
-            reward = float(result.get("reward") or 0.0)
-            done   = result.get("done", False)
+            result  = env_step(action_id)
+            reward  = float(result.get("reward") or 0.0)
+            done    = result.get("done", False)
+            message = result.get("message", "")
+
+            # Update junction in case it changed (it doesn't mid-episode but safe)
+            junction = result.get("junction_type", junction)
 
             rewards.append(reward)
             steps_taken = step
 
-            jt         = obs.get("junction_type", "cross")
-            action_str = ACTION_DESCRIPTIONS.get(jt, {}).get(action_id, str(action_id))
-            log_step(step=step, action=action_str, reward=reward, done=done, error=error_msg)
+            log_step(step=step, action=action_label,
+                     reward=reward, done=done, error=None)
 
             obs = result
+
             if done:
                 break
 
-    finally:
-        score   = min(max(sum(rewards) / MAX_TOTAL_REWARD, 0.0), 1.0)
+        # Score: normalise total reward to [0,1]
+        total = sum(rewards)
+        # rough max: 50 per step (emergency serve) × steps
+        max_possible = MAX_STEPS * 55.0
+        score   = min(max(total / max_possible, 0.0), 1.0)
         success = score >= SUCCESS_SCORE_THRESHOLD
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+    except Exception as e:
+        log_step(step=steps_taken + 1, action="error",
+                 reward=0.0, done=True, error=str(e))
+    finally:
+        log_end(success=success, steps=steps_taken,
+                score=score, rewards=rewards)
+
 
 if __name__ == "__main__":
     main()
