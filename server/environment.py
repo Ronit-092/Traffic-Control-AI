@@ -1,11 +1,9 @@
 """
 server/environment.py — Traffic signal control game logic.
 
-Fixes:
-  - Emergency vehicle always adds 1 to the lane count so it shows visually
-  - Waiting penalty reduced to 0.1 per vehicle (was 0.5 — too harsh)
-  - Emergency miss penalty reduced to 10 (was 20)
-  - Emergency served bonus stays at 50
+Key fix: emergency is generated at END of step (post-action arrivals phase)
+and stored so the NEXT step's player can see it and respond to it.
+This means the UI correctly shows the upcoming emergency BEFORE you act.
 """
 
 import random
@@ -51,6 +49,7 @@ class TrafficEnvironment(Environment):
         self._junction     = "cross"
         self._traffic      = {d: 0 for d in DIRECTIONS}
         self._emergency    = {d: False for d in DIRECTIONS}
+        self._pending_em   = None   # emergency lane queued for NEXT step
         self._total_reward = 0.0
         self._em_total     = 0
         self._em_served    = 0
@@ -63,6 +62,7 @@ class TrafficEnvironment(Environment):
         self._junction     = random.choice(["cross", "T", "Y"])
         self._traffic      = {d: 0 for d in DIRECTIONS}
         self._emergency    = {d: False for d in DIRECTIONS}
+        self._pending_em   = None
         self._total_reward = 0.0
         self._em_total     = 0
         self._em_served    = 0
@@ -75,6 +75,9 @@ class TrafficEnvironment(Environment):
         for lane in ACTIVE_LANES[self._junction]:
             self._traffic[lane] = random.randint(2, 10)
 
+        # Pre-generate first emergency so player can see it immediately
+        self._maybe_spawn_emergency()
+
         return self._make_obs(reward=None, done=False,
                               msg=f"New episode — {self._junction} junction")
 
@@ -83,22 +86,12 @@ class TrafficEnvironment(Environment):
         act = int(action.action_id)
         self._state.step_count += 1
 
-        # ── Emergency event ────────────────────────────────────────────
-        # Pick any active lane (or any lane if all empty)
-        candidates = [d for d, v in self._traffic.items()
-                      if v > 0 and d in ACTIVE_LANES[self._junction]]
-        if not candidates:
-            candidates = ACTIVE_LANES[self._junction]
+        # ── 1. Apply the pending emergency (player SAW this before acting) ──
+        # _emergency was already set in the previous step's response
+        em_lanes      = [d for d, v in self._emergency.items() if v]
+        em_served_now = False
 
-        self._emergency = {d: False for d in DIRECTIONS}
-        if random.random() < EMERGENCY_P:
-            em_dir = random.choice(candidates)
-            self._emergency[em_dir] = True
-            # FIX: ensure emergency lane shows at least 1 vehicle
-            if self._traffic[em_dir] == 0:
-                self._traffic[em_dir] = 1
-
-        # ── Clear served lanes ─────────────────────────────────────────
+        # ── 2. Clear served lanes ──────────────────────────────────────
         served  = ACTION_MAP[self._junction].get(act, [])
         cleared = 0
         for d in served:
@@ -107,23 +100,21 @@ class TrafficEnvironment(Environment):
 
         reward = float(cleared)
 
-        # ── Emergency bonus / penalty ──────────────────────────────────
-        em_lanes      = [d for d, v in self._emergency.items() if v]
-        em_served_now = False
+        # ── 3. Score the emergency ─────────────────────────────────────
         if em_lanes:
             self._em_total += 1
             if em_lanes[0] in served:
-                reward       += 50.0   # strong bonus for serving emergency
+                reward       += 50.0
                 em_served_now = True
                 self._em_served += 1
             else:
-                reward -= 10.0         # FIX: reduced from 20 to 10
+                reward -= 10.0
 
-        # ── Queue waiting penalty (reduced from 0.5 to 0.1) ───────────
-        total_waiting  = sum(self._traffic.values())
-        reward        -= 0.1 * total_waiting   # FIX: was 0.5
+        # ── 4. Queue waiting penalty ───────────────────────────────────
+        total_waiting = sum(self._traffic.values())
+        reward       -= 0.1 * total_waiting
 
-        # ── New arrivals ───────────────────────────────────────────────
+        # ── 5. New arrivals ────────────────────────────────────────────
         for lane in ACTIVE_LANES[self._junction]:
             if self._traffic[lane] > 0:
                 self._traffic[lane] += random.randint(0, MAX_ARRIVAL)
@@ -131,22 +122,40 @@ class TrafficEnvironment(Environment):
                 self._traffic[lane] += random.randint(1, 3)
             self._traffic[lane] = min(self._traffic[lane], MAX_QUEUE)
 
-        self._total_reward       += reward
-        self._state.total_reward  = self._total_reward
-        self._state.em_total      = self._em_total
-        self._state.em_served     = self._em_served
+        # ── 6. Spawn NEXT emergency (player will see this, then act) ───
+        self._emergency = {d: False for d in DIRECTIONS}
+        self._maybe_spawn_emergency()
+
+        self._total_reward      += reward
+        self._state.total_reward = self._total_reward
+        self._state.em_total     = self._em_total
+        self._state.em_served    = self._em_served
 
         label  = ACTION_LABELS[self._junction].get(act, str(act))
         em_str = ""
         if em_lanes:
             em_str = f" | 🚑 {'SERVED +50' if em_served_now else 'MISSED -10'}"
-        msg = f"Step {self._state.step_count}: {label} — cleared {cleared}{em_str}"
+        msg = (f"Step {self._state.step_count}: {label} — "
+               f"cleared {cleared}{em_str}")
 
         return self._make_obs(reward=reward, done=False, msg=msg)
 
     @property
     def state(self) -> TrafficState:
         return self._state
+
+    def _maybe_spawn_emergency(self):
+        """Spawn an emergency on an active lane with vehicles (or any active lane)."""
+        if random.random() < EMERGENCY_P:
+            candidates = [d for d in ACTIVE_LANES[self._junction]
+                          if self._traffic[d] > 0]
+            if not candidates:
+                candidates = ACTIVE_LANES[self._junction]
+            em_dir = random.choice(candidates)
+            self._emergency[em_dir] = True
+            # Ensure at least 1 vehicle so it's visible
+            if self._traffic[em_dir] == 0:
+                self._traffic[em_dir] = 1
 
     def _make_obs(self, reward, done, msg) -> TrafficObservation:
         return TrafficObservation(
