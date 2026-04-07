@@ -2,7 +2,7 @@ name: traffic-ai
 version: "1.0.0"
 description: >
   Traffic signal control RL environment.
-  PPO agent manages vehicle queues at Cross, T, and Y junctions,
+  An agent manages vehicle queues at Cross, T, and Y junctions,
   maximising throughput while prioritising emergency vehicles.
 author: Ronit-9
 license: MIT
@@ -10,26 +10,33 @@ license: MIT
 server:
   module: server.app
   app: app
-  port: 8000
+  port: 7860
 
 tasks:
   - id: easy
     file: tasks/task_easy.py
     entry: run
     description: "Simple NS vs EW heuristic — 10 steps"
+    grader:
+      file: graders/grader.py
+      entry: grade
+
   - id: medium
     file: tasks/task_medium.py
     entry: run
     description: "Emergency-aware weighted scorer — 15 steps"
+    grader:
+      file: graders/grader.py
+      entry: grade
+
   - id: hard
     file: tasks/task_hard.py
     entry: run
-    description: "1-step lookahead planner + surges — 20 steps"
-
-grader:
-  file: graders/grader.py
-  entry: grade
+    description: "1-step lookahead planner with surges — 20 steps"
+    grader:
+      file: graders/grader.py
+      entry: grade
 
 docker:
-  dockerfile: server/Dockerfile
-  port: 8000
+  dockerfile: Dockerfile
+  port: 7860
