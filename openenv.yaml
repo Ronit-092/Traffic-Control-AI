@@ -1,42 +1,82 @@
 name: traffic-ai
 version: "1.0.0"
 description: >
-  Traffic signal control RL environment.
+  Traffic signal control RL environment for AI agent training.
   An agent manages vehicle queues at Cross, T, and Y junctions,
   maximising throughput while prioritising emergency vehicles.
 author: Ronit-9
 license: MIT
 
-server:
-  module: server.app
-  app: app
-  port: 7860
+tags:
+  - openenv
+  - traffic
+  - reinforcement-learning
+  - emergency-vehicles
+  - real-world
 
 tasks:
   - id: easy
-    file: tasks/task_easy.py
-    entry: run
-    description: "Simple NS vs EW heuristic — 10 steps"
-    grader:
-      file: graders/grader.py
-      entry: grade
+    description: "Simple NS vs EW signal control — 10 steps"
+    difficulty: easy
+    max_steps: 10
+    scoring: "0.0-1.0 normalised reward"
 
   - id: medium
-    file: tasks/task_medium.py
-    entry: run
-    description: "Emergency-aware weighted scorer — 15 steps"
-    grader:
-      file: graders/grader.py
-      entry: grade
+    description: "Emergency-aware signal control — 15 steps"
+    difficulty: medium
+    max_steps: 15
+    scoring: "0.0-1.0 normalised reward"
 
   - id: hard
-    file: tasks/task_hard.py
-    entry: run
-    description: "1-step lookahead planner with surges — 20 steps"
-    grader:
-      file: graders/grader.py
-      entry: grade
+    description: "Congested junction with traffic surges — 20 steps"
+    difficulty: hard
+    max_steps: 20
+    scoring: "0.0-1.0 normalised reward"
 
-docker:
-  dockerfile: Dockerfile
+observation_space:
+  traffic_counts: "dict — vehicle queue per direction (N/S/E/W)"
+  obs_normalized: "list[float] — normalised queues in [0,1]"
+  emergency: "dict — which lane has an emergency vehicle"
+  junction_type: "string — cross | T | Y"
+  reward: "float — reward from last action"
+  done: "bool — episode complete"
+  message: "string — human-readable step description"
+
+action_space:
+  action_id: "int (0-3) — signal direction to make green"
+
+reward:
+  type: continuous
+  range: [-30.0, 60.0]
+  shaping:
+    - "+1 per vehicle cleared"
+    - "+50 emergency vehicle served"
+    - "-10 emergency vehicle ignored"
+    - "-0.1 per vehicle still waiting (urgency penalty)"
+
+endpoints:
+  - path: /reset
+    method: POST
+    description: "Start new episode"
+  - path: /step
+    method: POST
+    description: "Take signal action"
+  - path: /state
+    method: GET
+    description: "Episode metadata"
+  - path: /grader
+    method: POST
+    description: "Grade a task result"
+  - path: /baseline
+    method: GET
+    description: "Run all 3 tasks and return scores"
+  - path: /health
+    method: GET
+    description: "Health check"
+
+runtime:
+  framework: FastAPI + OpenEnv
+  python: "3.11"
+  docker: true
+  hf_spaces: true
   port: 7860

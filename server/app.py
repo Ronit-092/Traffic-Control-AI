@@ -3,7 +3,6 @@ server/app.py — FastAPI server with live dashboard.
 Custom REST endpoints with exact response format the UI expects.
 """
 
-import os
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -77,6 +76,71 @@ def _fmt(obs: TrafficObservation) -> dict:
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────
+
+# ── Grader endpoint ────────────────────────────────────────────────────
+class GraderRequest(BaseModel):
+    reward:    float
+    em_total:  int = 0
+    em_served: int = 0
+    steps:     int = 10
+
+@app.post("/grader")
+def grader(req: GraderRequest):
+    """Grade a task result. Returns normalised score in [0.0, 1.0]."""
+    per_step = req.reward / max(req.steps, 1)
+    raw = min(max(per_step / 10.0, 0.0), 1.0)
+    em_bonus = 0.1 if (req.em_total > 0 and req.em_served / req.em_total >= 0.80) else 0.0
+    score = round(min(raw + em_bonus, 1.0), 3)
+    return {"score": score, "per_step_reward": round(per_step, 3)}
+
+
+# ── Baseline endpoint ──────────────────────────────────────────────────
+@app.get("/baseline")
+def baseline():
+    """Run all 3 tasks with rule-based agents and return scores."""
+    import sys, os, random
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    results = {}
+    for task_id, steps in [("easy", 10), ("medium", 15), ("hard", 20)]:
+        env2 = TrafficEnvironment()
+        obs  = env2.reset(seed=42)
+        total = 0.0
+        for _ in range(steps):
+            # Simple heuristic: serve direction with most vehicles
+            tc = obs.traffic_counts
+            # Check emergency first
+            em = [d for d, v in obs.emergency.items() if v]
+            from server.environment import ACTION_MAP
+            if em:
+                em_dir = em[0]
+                act = 0
+                for a, dirs in ACTION_MAP[env2._junction].items():
+                    if em_dir in dirs:
+                        act = a
+                        break
+            else:
+                ns = tc.get("north",0) + tc.get("south",0)
+                ew = tc.get("east",0)  + tc.get("west",0)
+                act = 0 if ns >= ew else 1
+            obs = env2.step(TrafficAction(action_id=act))
+            total += obs.reward or 0.0
+        per_step = total / steps
+        score = round(min(max(per_step / 10.0, 0.0), 1.0), 3)
+        results[task_id] = {"score": score, "total_reward": round(total, 2), "steps": steps}
+    return results
+
+
+# ── Tasks list endpoint ────────────────────────────────────────────────
+@app.get("/tasks")
+def tasks():
+    return [
+        {"id": "easy",   "description": "NS vs EW heuristic",          "steps": 10, "difficulty": "easy"},
+        {"id": "medium", "description": "Emergency-aware controller",   "steps": 15, "difficulty": "medium"},
+        {"id": "hard",   "description": "Lookahead planner with surges","steps": 20, "difficulty": "hard"},
+    ]
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     return HTML
@@ -382,8 +446,7 @@ window.onload=()=>setTimeout(doReset,400);
 
 
 def main():
-    port = int(os.getenv("PORT", 7860))
-    uvicorn.run("server.app:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("server.app:app", host="0.0.0.0", port=8000, reload=False)
 
 
 if __name__ == "__main__":
