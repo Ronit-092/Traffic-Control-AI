@@ -1,7 +1,7 @@
 [project]
 name = "traffic-ai"
 version = "1.0.0"
-description = "Traffic signal control RL environment — ScalarX x Meta Hackathon 2026"
+description = "Traffic signal control RL environment"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"

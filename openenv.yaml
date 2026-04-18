@@ -1,7 +1,7 @@
 name: traffic-ai
 version: "1.0.0"
 description: >
-  Traffic signal control RL environment for AI agent training.
+  Traffic signal control RL environment.
   An agent manages vehicle queues at Cross, T, and Y junctions,
   maximising throughput while prioritising emergency vehicles.
 author: Ronit-9
@@ -52,7 +52,7 @@ reward:
     - "+1 per vehicle cleared"
     - "+50 emergency vehicle served"
     - "-10 emergency vehicle ignored"
-    - "-0.1 per vehicle still waiting (urgency penalty)"
+    - "-0.1 per vehicle still waiting"
 
 endpoints:
   - path: /reset
@@ -78,5 +78,4 @@ runtime:
   framework: FastAPI + OpenEnv
   python: "3.11"
   docker: true
-  hf_spaces: true
   port: 7860

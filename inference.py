@@ -1,139 +1,286 @@
 """
-inference.py — LLM agent running ALL 3 tasks on Traffic-AI OpenEnv.
-Each task gets its own [START]...[STEP]...[END] block.
-Difficulty level printed in logs as required by checker.
+server/app.py — FastAPI server with live dashboard.
 """
 
-import os, json, textwrap
-from typing import List, Optional
-import requests
-from openai import OpenAI
+import os
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional
 
-API_BASE_URL     = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME       = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN         = os.getenv("HF_TOKEN")
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+from models import TrafficAction, TrafficObservation
+from server.environment import TrafficEnvironment
 
-API_KEY   = HF_TOKEN or os.getenv("API_KEY", "dummy")
-ENV_URL   = "https://ronit-9-traffic-control-ai.hf.space"
-BENCHMARK = "traffic-ai"
-SUCCESS_SCORE_THRESHOLD = 0.1
+app = FastAPI(title="Traffic-AI Signal Control", version="1.0.0")
 
-TASKS = [
-    {"id": "easy",   "difficulty": "easy",   "max_steps": 10},
-    {"id": "medium", "difficulty": "medium", "max_steps": 15},
-    {"id": "hard",   "difficulty": "hard",   "max_steps": 20},
-]
+_env   = TrafficEnvironment()
+_ready = False
 
-client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-def log_start(task, env, model):
-    print(f"[START] task={task} env={env} model={model}", flush=True)
+class ResetRequest(BaseModel):
+    seed: Optional[int] = None
 
-def log_step(step, action, reward, done, error):
-    err = error if error else "null"
-    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={err}", flush=True)
+class StepRequest(BaseModel):
+    action_id: int
 
-def log_end(success, steps, score, rewards):
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={','.join(f'{r:.2f}' for r in rewards)}", flush=True)
+class GraderRequest(BaseModel):
+    reward:    float
+    em_total:  int = 0
+    em_served: int = 0
+    steps:     int = 10
 
-ACTION_LABELS = {
-    "cross": {0:"NS-green",1:"EW-green",2:"North-only",3:"East-only"},
-    "T":     {0:"NS-green",1:"East-green",2:"North-only",3:"South-only"},
-    "Y":     {0:"North",1:"East",2:"West",3:"North+East"},
-}
 
-SYSTEM_PROMPT = "You are a traffic signal controller. Prioritise emergency vehicles. Otherwise clear most congested lanes. Reply ONLY with JSON: {\"action_id\": <0-3>, \"reason\": \"<brief>\"}"
+@app.get("/health")
+def health():
+    return {"status": "healthy", "ready": _ready}
 
-def env_reset(seed=None):
-    body = {"seed": seed} if seed is not None else {}
-    r = requests.post(f"{ENV_URL}/reset", json=body, headers={"Content-Type":"application/json"}, timeout=30)
-    r.raise_for_status()
-    return r.json()
 
-def env_step(action_id):
-    r = requests.post(f"{ENV_URL}/step", json={"action_id": action_id}, headers={"Content-Type":"application/json"}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+@app.post("/reset")
+def reset(req: ResetRequest = ResetRequest()):
+    global _ready
+    obs    = _env.reset(seed=req.seed)
+    _ready = True
+    return _fmt(obs)
 
-def get_llm_action(obs, junction):
-    tc = obs.get("traffic_counts", {})
-    em = obs.get("emergency", {})
-    em_lanes = [d for d,v in em.items() if v]
-    em_str = f"EMERGENCY:{em_lanes[0].upper()}" if em_lanes else "no-emergency"
-    labels = ACTION_LABELS.get(junction, ACTION_LABELS["cross"])
-    prompt = f"junction={junction} N={tc.get('north',0)} S={tc.get('south',0)} E={tc.get('east',0)} W={tc.get('west',0)} {em_str} actions={labels}"
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":prompt}],
-            max_tokens=80, temperature=0.2,
-        )
-        content = resp.choices[0].message.content.strip()
-        if "```" in content:
-            content = content.split("```")[1].lstrip("json").strip()
-        parsed = json.loads(content)
-        return max(0, min(3, int(parsed.get("action_id", 0)))), parsed.get("reason","")
-    except Exception as e:
-        tc2 = obs.get("traffic_counts", {})
-        ns = tc2.get("north",0) + tc2.get("south",0)
-        ew = tc2.get("east",0)  + tc2.get("west",0)
-        return (0 if ns >= ew else 1), f"fallback"
 
-def run_task(task):
-    task_id    = task["id"]
-    difficulty = task["difficulty"]
-    max_steps  = task["max_steps"]
+@app.post("/step")
+def step(req: StepRequest):
+    global _ready
+    if not _ready:
+        _env.reset()
+        _ready = True
+    obs = _env.step(TrafficAction(action_id=req.action_id))
+    return _fmt(obs)
 
-    # Print difficulty in logs — required by checker
-    print(f"# difficulty={difficulty} task={task_id}", flush=True)
-    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
-    rewards = []
-    steps_taken = 0
-    score = 0.0
-    success = False
+@app.get("/state")
+def state():
+    s = _env.state
+    return {
+        "episode_id":    s.episode_id,
+        "step_count":    s.step_count,
+        "junction_type": _env._junction,
+        "total_reward":  _env._total_reward,
+        "em_total":      _env._em_total,
+        "em_served":     _env._em_served,
+    }
 
-    try:
-        obs = env_reset(seed=42)
-        junction = obs.get("junction_type", "cross")
 
-        for step in range(1, max_steps + 1):
-            if obs.get("done", False):
-                break
-            action_id, _ = get_llm_action(obs, junction)
-            labels = ACTION_LABELS.get(junction, ACTION_LABELS["cross"])
-            action_label = labels.get(action_id, str(action_id))
-            result   = env_step(action_id)
-            reward   = float(result.get("reward") or 0.0)
-            done     = result.get("done", False)
-            junction = result.get("junction_type", junction)
-            rewards.append(reward)
-            steps_taken = step
-            log_step(step=step, action=action_label, reward=reward, done=done, error=None)
-            obs = result
-            if done:
-                break
+@app.post("/grader")
+def grader(req: GraderRequest):
+    per_step = req.reward / max(req.steps, 1)
+    raw      = min(max(per_step / 10.0, 0.0), 1.0)
+    em_bonus = 0.1 if (req.em_total > 0 and req.em_served / req.em_total >= 0.80) else 0.0
+    score    = round(min(raw + em_bonus, 1.0), 3)
+    return {"score": score, "per_step_reward": round(per_step, 3)}
 
-        total = sum(rewards)
-        score = round(min(max(total / (max_steps * 55.0), 0.0), 1.0), 3)
-        success = score >= SUCCESS_SCORE_THRESHOLD
 
-    except Exception as e:
-        log_step(step=steps_taken+1, action="error", reward=0.0, done=True, error=str(e))
-    finally:
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+@app.get("/baseline")
+def baseline():
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from tasks.task_easy   import run as easy_run
+    from tasks.task_medium import run as medium_run
+    from tasks.task_hard   import run as hard_run
+    results = {}
+    for name, fn, steps in [("easy", easy_run, 10), ("medium", medium_run, 15), ("hard", hard_run, 20)]:
+        r        = fn(steps=steps, seed=42)
+        per_step = r["reward"] / steps
+        results[name] = {
+            "score":      round(min(max(per_step / 10.0, 0.0), 1.0), 3),
+            "reward":     round(r["reward"], 2),
+            "em_served":  r["em_served"],
+            "em_total":   r["em_total"],
+        }
+    return results
 
-    return score
+
+@app.get("/tasks")
+def tasks():
+    return [
+        {"id": "easy",   "description": "NS vs EW heuristic",           "steps": 10, "difficulty": "easy"},
+        {"id": "medium", "description": "Emergency-aware controller",    "steps": 15, "difficulty": "medium"},
+        {"id": "hard",   "description": "Lookahead planner with surges", "steps": 20, "difficulty": "hard"},
+    ]
+
+
+def _fmt(obs: TrafficObservation) -> dict:
+    return {
+        "traffic_counts": obs.traffic_counts,
+        "obs_normalized": obs.obs_normalized,
+        "emergency":      obs.emergency,
+        "junction_type":  obs.junction_type,
+        "reward":         obs.reward if obs.reward is not None else 0.0,
+        "done":           obs.done,
+        "message":        obs.message,
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    return HTML
+
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Traffic-AI Signal Control</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e0e0e0;min-height:100vh}
+.hdr{background:#151b2d;padding:22px 36px;border-bottom:1px solid #1e2640;display:flex;align-items:center;gap:14px}
+.hdr h1{font-size:22px;font-weight:700;color:#fff}
+.pill{font-size:11px;padding:3px 10px;border-radius:20px;font-weight:600}
+.pill-green{background:#065f46;color:#34d399}
+.sub{color:#64748b;font-size:13px;margin-left:auto}
+.wrap{max-width:1080px;margin:0 auto;padding:28px 20px;display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.card{background:#151b2d;border:1px solid #1e2640;border-radius:14px;padding:22px}
+.card-title{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#475569;margin-bottom:18px;font-weight:600}
+.full{grid-column:1/-1}
+.jgrid{display:grid;grid-template-columns:1fr 80px 1fr;grid-template-rows:1fr 80px 1fr;gap:8px;width:260px;height:260px;margin:0 auto}
+.jcell{border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;border:1.5px solid #1e2640;background:#0d1117;transition:all .3s}
+.jcell.has-cars{background:#0f2419;border-color:#065f46}
+.jcell.emergency{background:#2d0f0f;border-color:#dc2626;animation:blink .8s infinite}
+.jcell.center{background:#1a2035;border-color:#2d3a5a;font-size:26px}
+.jcell.empty{background:transparent;border-color:transparent}
+.jnum{font-size:26px;font-weight:800;color:#f1f5f9}
+.jlbl{font-size:10px;color:#475569;text-transform:uppercase;margin-top:2px}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.5}}
+.tags{display:flex;gap:8px;justify-content:center;margin-top:14px;flex-wrap:wrap}
+.tag{font-size:11px;padding:3px 10px;border-radius:20px;background:#1a2035;border:1px solid #2d3a5a;color:#94a3b8}
+.tag.em-active{background:#2d0f0f;border-color:#dc2626;color:#f87171}
+.srow{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #1e2640}
+.srow:last-child{border-bottom:none}
+.slbl{color:#64748b;font-size:14px}
+.sval{font-size:15px;font-weight:700;color:#f1f5f9}
+.sval.pos{color:#34d399}
+.sval.neg{color:#f87171}
+.sval.blue{color:#818cf8}
+.bar-wrap{height:5px;background:#1e2640;border-radius:3px;margin-top:6px;overflow:hidden}
+.bar-fill{height:100%;background:linear-gradient(90deg,#6366f1,#10b981);border-radius:3px;transition:width .5s;width:0%}
+.abtn{width:100%;background:#0d1117;border:1.5px solid #1e2640;color:#94a3b8;padding:11px 16px;border-radius:9px;cursor:pointer;font-size:13px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;transition:all .2s}
+.abtn:hover{background:#1a2035;border-color:#6366f1;color:#e0e0e0}
+.abtn.chosen{background:#1a2035;border-color:#6366f1;color:#a5b4fc}
+.abtn .acode{font-family:monospace;color:#475569;font-size:11px}
+.abtn.chosen .acode{color:#818cf8}
+.btn-reset{width:100%;margin-top:12px;padding:12px;background:#6366f1;color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;transition:all .2s}
+.btn-reset:hover{background:#4f46e5}
+.btn-docs{width:100%;margin-top:8px;padding:10px;background:#1a2035;color:#94a3b8;border:1.5px solid #1e2640;border-radius:10px;font-size:13px;cursor:pointer;transition:all .2s}
+.btn-docs:hover{background:#252b3b;color:#e0e0e0}
+.logbox{background:#080c14;border:1px solid #1e2640;border-radius:10px;padding:14px;font-family:'SF Mono','Fira Code',monospace;font-size:12px;height:200px;overflow-y:auto;color:#64748b}
+.le{margin-bottom:3px}
+.le .t{color:#334155}
+.le .m{color:#94a3b8}
+.le .rp{color:#34d399;font-weight:600}
+.le .rn{color:#f87171;font-weight:600}
+.le .em{color:#fbbf24;font-weight:600}
+.le .start{color:#818cf8;font-weight:600}
+.epgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.ep{background:#0d1117;border:1px solid #1e2640;border-radius:8px;padding:10px 13px;font-size:12px;font-family:monospace}
+.em2{color:#818cf8;font-weight:700;margin-right:6px}
+.ep2{color:#34d399}
+.rhistory{display:flex;align-items:flex-end;gap:3px;height:50px;margin-top:14px}
+.rbar{flex:1;border-radius:3px 3px 0 0;min-height:2px;transition:height .4s,background .4s}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <span style="font-size:24px">🚦</span>
+  <h1>Traffic-AI Signal Control</h1>
+  <span class="pill pill-green">LIVE</span>
+  <span class="sub">OpenEnv RL Environment</span>
+</div>
+
+<div class="wrap">
+
+  <div class="card">
+    <div class="card-title">Live Junction View</div>
+    <div class="jgrid">
+      <div class="jcell empty"></div>
+      <div class="jcell" id="c-north"><div class="jnum" id="n-north">–</div><div class="jlbl">North</div></div>
+      <div class="jcell empty"></div>
+      <div class="jcell" id="c-west"><div class="jnum" id="n-west">–</div><div class="jlbl">West</div></div>
+      <div class="jcell center">🚦</div>
+      <div class="jcell" id="c-east"><div class="jnum" id="n-east">–</div><div class="jlbl">East</div></div>
+      <div class="jcell empty"></div>
+      <div class="jcell" id="c-south"><div class="jnum" id="n-south">–</div><div class="jlbl">South</div></div>
+      <div class="jcell empty"></div>
+    </div>
+    <div class="tags">
+      <span class="tag" id="tag-jt">–</span>
+      <span class="tag" id="tag-em">No emergency</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Episode Stats</div>
+    <div class="srow"><span class="slbl">Total Reward</span><span class="sval pos" id="s-total">0.0</span></div>
+    <div class="bar-wrap"><div class="bar-fill" id="s-bar"></div></div>
+    <div class="srow" style="margin-top:10px"><span class="slbl">Step</span><span class="sval blue" id="s-step">0</span></div>
+    <div class="srow"><span class="slbl">Last Reward</span><span class="sval" id="s-lastr">–</span></div>
+    <div class="srow"><span class="slbl">Last Action</span><span class="sval" id="s-lasta">–</span></div>
+    <div class="srow"><span class="slbl">Junction Type</span><span class="sval" id="s-jt">–</span></div>
+    <div class="srow"><span class="slbl">Vehicles Cleared</span><span class="sval pos" id="s-cleared">0</span></div>
+    <div class="rhistory" id="rhistory"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Signal Controls</div>
+    <button class="abtn" id="a0" onclick="act(0)"><span class="acode">ACT 0</span><span id="d0">NS Green</span></button>
+    <button class="abtn" id="a1" onclick="act(1)"><span class="acode">ACT 1</span><span id="d1">EW Green</span></button>
+    <button class="abtn" id="a2" onclick="act(2)"><span class="acode">ACT 2</span><span id="d2">North only</span></button>
+    <button class="abtn" id="a3" onclick="act(3)"><span class="acode">ACT 3</span><span id="d3">East only</span></button>
+    <button class="btn-reset" onclick="doReset()">↺  Reset Episode</button>
+    <button class="btn-docs" onclick="window.open('/docs','_blank')">📖  API Docs</button>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Step Log</div>
+    <div class="logbox" id="logbox">
+      <div class="le"><span class="t">–</span> <span class="m">Press Reset Episode to start</span></div>
+    </div>
+  </div>
+
+  <div class="card full">
+    <div class="card-title">API Endpoints</div>
+    <div class="epgrid">
+      <div class="ep"><span class="em2">GET</span><span class="ep2">/health</span></div>
+      <div class="ep"><span class="em2">POST</span><span class="ep2">/reset</span></div>
+      <div class="ep"><span class="em2">POST</span><span class="ep2">/step</span> {"action_id": 0}</div>
+      <div class="ep"><span class="em2">GET</span><span class="ep2">/state</span></div>
+      <div class="ep"><span class="em2">GET</span><span class="ep2">/baseline</span></div>
+      <div class="ep"><span class="em2">GET</span><span class="ep2">/docs</span></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const AL={cross:{0:'NS Green',1:'EW Green',2:'North only',3:'East only'},T:{0:'NS Green',1:'East Green',2:'North only',3:'South only'},Y:{0:'North',1:'East',2:'West',3:'North+East'}};
+let step=0,totalR=0,jt='cross',totalCleared=0,rewards=[],lastChosen=-1;
+function ts(){return new Date().toLocaleTimeString();}
+function addLog(msg,cls='m'){const b=document.getElementById('logbox');const d=document.createElement('div');d.className='le';d.innerHTML=`<span class="t">[${ts()}]</span> <span class="${cls}">${msg}</span>`;b.appendChild(d);b.scrollTop=b.scrollHeight;}
+function setCell(dir,count,isEm){const c=document.getElementById('c-'+dir);const n=document.getElementById('n-'+dir);if(!c)return;n.textContent=count;c.className='jcell'+(isEm?' emergency':count>0?' has-cars':'');}
+function updateLabels(){const labels=AL[jt]||AL.cross;for(let i=0;i<4;i++)document.getElementById('d'+i).textContent=labels[i];}
+function renderHistory(){const h=document.getElementById('rhistory');h.innerHTML='';const last=rewards.slice(-20);if(!last.length)return;const mx=Math.max(...last.map(Math.abs),1);last.forEach(r=>{const d=document.createElement('div');d.className='rbar';d.style.height=Math.max(4,Math.abs(r)/mx*46)+'px';d.style.background=r>=0?'#10b981':'#ef4444';d.title=(r>=0?'+':'')+r.toFixed(1);h.appendChild(d);});}
+function applyObs(data,reward){const tc=data.traffic_counts||{};const em=data.emergency||{};jt=data.junction_type||'cross';['north','south','east','west'].forEach(d=>setCell(d,tc[d]||0,em[d]));document.getElementById('tag-jt').textContent=jt+' junction';const emDirs=Object.entries(em).filter(([,v])=>v).map(([k])=>k);const emEl=document.getElementById('tag-em');if(emDirs.length){emEl.textContent='🚑 Emergency: '+emDirs[0];emEl.className='tag em-active';addLog('🚑 Emergency at '+emDirs[0].toUpperCase()+'!','em');}else{emEl.textContent='No emergency';emEl.className='tag';}
+if(reward!==null){step++;totalR+=reward;rewards.push(reward);const m=data.message||'';const match=m.match(/cleared (\d+)/);if(match)totalCleared+=parseInt(match[1]);const rEl=document.getElementById('s-lastr');rEl.textContent=(reward>=0?'+':'')+reward.toFixed(2);rEl.className='sval '+(reward>=0?'pos':'neg');document.getElementById('s-total').textContent=totalR.toFixed(2);document.getElementById('s-step').textContent=step;document.getElementById('s-jt').textContent=jt;document.getElementById('s-cleared').textContent=totalCleared;const pct=Math.min(100,Math.max(0,(totalR+50)/110*100));document.getElementById('s-bar').style.width=pct+'%';const labels=AL[jt]||AL.cross;document.getElementById('s-lasta').textContent=labels[lastChosen]||'–';addLog(`Step ${step} → ${labels[lastChosen]||'?'} | reward ${reward>=0?'+':''}${reward.toFixed(2)} | total ${totalR.toFixed(2)}`,reward>0?'rp':reward<0?'rn':'m');renderHistory();}updateLabels();}
+async function doReset(){step=0;totalR=0;rewards=[];totalCleared=0;lastChosen=-1;document.getElementById('s-total').textContent='0.0';document.getElementById('s-step').textContent='0';document.getElementById('s-lastr').textContent='–';document.getElementById('s-lasta').textContent='–';document.getElementById('s-cleared').textContent='0';document.getElementById('s-bar').style.width='0%';document.getElementById('logbox').innerHTML='';document.querySelectorAll('.abtn').forEach(b=>b.classList.remove('chosen'));document.getElementById('rhistory').innerHTML='';try{const r=await fetch('/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const d=await r.json();applyObs(d,null);addLog('Episode started · '+d.junction_type+' junction','start');}catch(e){addLog('Error: '+e.message,'rn');}}
+async function act(id){document.querySelectorAll('.abtn').forEach(b=>b.classList.remove('chosen'));document.getElementById('a'+id).classList.add('chosen');lastChosen=id;try{const r=await fetch('/step',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action_id:id})});const d=await r.json();applyObs(d,d.reward??0);}catch(e){addLog('Error: '+e.message,'rn');}}
+window.onload=()=>setTimeout(doReset,400);
+</script>
+</body>
+</html>"""
+
 
 def main():
-    print(f"# Traffic-AI — running {len(TASKS)} tasks: easy, medium, hard", flush=True)
-    all_scores = []
-    for task in TASKS:
-        score = run_task(task)
-        all_scores.append(score)
-        print(f"# DONE task={task['id']} difficulty={task['difficulty']} score={score:.3f}", flush=True)
-    print(f"# ALL_DONE avg={sum(all_scores)/len(all_scores):.3f}", flush=True)
+    port = int(os.getenv("PORT", 7860))
+    uvicorn.run("server.app:app", host="0.0.0.0", port=port, reload=False)
+
 
 if __name__ == "__main__":
     main()
